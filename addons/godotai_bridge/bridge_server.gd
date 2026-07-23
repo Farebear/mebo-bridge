@@ -12,7 +12,7 @@ extends RefCounted
 const DEFAULT_PORT := 6010
 # Must match plugin.cfg's version; ping reports it so the IDE can tell when a
 # stale copy of the addon is still the one running in the editor.
-const VERSION := "0.3.0"
+const VERSION := "0.4.0"
 # Byte length of the "\r\n\r\n" header terminator. (A PackedByteArray
 # constructor call is not a constant expression, so keep the size, not
 # the bytes; _find_header_end matches the bytes directly.)
@@ -200,6 +200,8 @@ func _handle(method: String, p: Dictionary) -> Dictionary:
 			return _ok({"ok": true})
 		"capture_screenshot":
 			return _capture_screenshot(p)
+		"get_run_state":
+			return _get_run_state()
 		"run_project":
 			var main_scene := _sync_run_settings()
 			if main_scene.is_empty():
@@ -218,6 +220,32 @@ func _handle(method: String, p: Dictionary) -> Dictionary:
 			return _ok({"ok": true})
 		_:
 			return _err(-32601, "Method not found: %s" % method)
+
+
+# --- Run state ---------------------------------------------------------------
+
+## Whether a game launched from this editor is playing, and where that game
+## writes its file log. Resolving user:// here (instead of in the IDE) means
+## project-name and custom-user-dir overrides are honored for free; the
+## overrides variant of get_setting applies the .pc platform tag the game
+## itself runs with (file logging defaults to ON for desktop platforms only).
+func _get_run_state() -> Dictionary:
+	var playing := EditorInterface.is_playing_scene()
+	var scene := EditorInterface.get_playing_scene()
+	var log_setting: Variant = ProjectSettings.get_setting_with_override(
+		"debug/file_logging/log_path")
+	var log_path := "user://logs/godot.log"
+	if typeof(log_setting) == TYPE_STRING and not str(log_setting).is_empty():
+		log_path = str(log_setting)
+	var enabled_setting: Variant = ProjectSettings.get_setting_with_override(
+		"debug/file_logging/enable_file_logging")
+	return _ok({
+		"playing": playing,
+		"playingScene": scene if playing and not scene.is_empty() else null,
+		"userDataDir": OS.get_user_data_dir(),
+		"logPath": ProjectSettings.globalize_path(log_path),
+		"fileLoggingEnabled": bool(enabled_setting) if typeof(enabled_setting) == TYPE_BOOL else true,
+	})
 
 
 # --- Run preparation ---------------------------------------------------------
