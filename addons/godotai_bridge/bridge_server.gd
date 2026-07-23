@@ -12,7 +12,7 @@ extends RefCounted
 const DEFAULT_PORT := 6010
 # Must match plugin.cfg's version; ping reports it so the IDE can tell when a
 # stale copy of the addon is still the one running in the editor.
-const VERSION := "0.4.0"
+const VERSION := "0.5.0"
 # Byte length of the "\r\n\r\n" header terminator. (A PackedByteArray
 # constructor call is not a constant expression, so keep the size, not
 # the bytes; _find_header_end matches the bytes directly.)
@@ -180,6 +180,8 @@ func _handle(method: String, p: Dictionary) -> Dictionary:
 			return _attach_script(p)
 		"connect_signal":
 			return _connect_signal(p)
+		"instantiate_scene":
+			return _instantiate_scene(p)
 		"save_scene":
 			var err := EditorInterface.save_scene()
 			if err != OK:
@@ -202,6 +204,10 @@ func _handle(method: String, p: Dictionary) -> Dictionary:
 			return _capture_screenshot(p)
 		"get_run_state":
 			return _get_run_state()
+		"get_tilemap":
+			return _get_tilemap(p)
+		"edit_tilemap":
+			return _edit_tilemap(p)
 		"run_project":
 			var main_scene := _sync_run_settings()
 			if main_scene.is_empty():
@@ -441,11 +447,19 @@ func _serialize_node(node: Node, root: Node) -> Dictionary:
 	for child in node.get_children():
 		children.append(_serialize_node(child, root))
 
+	# Instance roots carry the scene they instantiate ("prefab" boundary) so
+	# the IDE can tell "edit the source scene" from "edit this copy". The
+	# edited root's own scene_file_path is just the open file — not a boundary.
+	var scene_path: Variant = null
+	if node != root and not node.scene_file_path.is_empty():
+		scene_path = node.scene_file_path
+
 	return {
 		"name": str(node.name),
 		"type": node.get_class(),
 		"path": "." if node == root else str(root.get_path_to(node)),
 		"scriptResPath": script_path,
+		"sceneFilePath": scene_path,
 		"properties": properties,
 		"children": children,
 	}
@@ -535,6 +549,39 @@ func _attach_script(p: Dictionary) -> Dictionary:
 	return _ok({"ok": true})
 
 
+## Instance a saved scene under a parent — the live equivalent of dropping a
+## "prefab" into the scene. The instance is owned by the edited root so it
+## persists as `instance=ExtResource(...)` when the scene is saved.
+func _instantiate_scene(p: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return _err(-32000, "No scene is open in the editor.")
+	var parent := _get_node(str(p.get("parentPath", ".")))
+	if parent == null:
+		return _err(-32000, "Parent node not found: %s" % str(p.get("parentPath")))
+	var scene_path := str(p.get("sceneResPath", ""))
+	if not ResourceLoader.exists(scene_path):
+		return _err(-32000, "Scene not found: %s" % scene_path)
+	if root.scene_file_path == scene_path:
+		return _err(-32000, "Refusing to instance %s into itself." % scene_path)
+	var packed: Variant = load(scene_path)
+	if not (packed is PackedScene):
+		return _err(-32000, "%s is not a scene." % scene_path)
+	# GEN_EDIT_STATE_INSTANCE marks the root the way the editor's own
+	# "Instantiate Child Scene" does — without it, saving re-serializes the
+	# root's type/script onto the instance node as spurious overrides.
+	var instance := (packed as PackedScene).instantiate(PackedScene.GEN_EDIT_STATE_INSTANCE)
+	if instance == null:
+		return _err(-32000, "Could not instantiate %s." % scene_path)
+	var custom_name := str(p.get("name", ""))
+	if not custom_name.is_empty():
+		instance.name = custom_name
+	parent.add_child(instance)
+	instance.owner = root  # persists the node as a scene instance on save
+	_mark_unsaved()
+	return _ok({"path": str(root.get_path_to(instance))})
+
+
 func _connect_signal(p: Dictionary) -> Dictionary:
 	var from_node := _get_node(str(p.get("fromPath", "")))
 	if from_node == null:
@@ -587,6 +634,321 @@ func _capture_screenshot(p: Dictionary) -> Dictionary:
 		"height": image.get_height(),
 		"mediaType": "image/png",
 	})
+
+
+# --- Tilemap operations ------------------------------------------------------
+# Both TileMapLayer (4.3+) and the deprecated TileMap node are supported; for
+# TileMap, `layer` picks which internal layer the operation touches.
+
+## Cells listed by get_tilemap before truncating (narrow with `region`).
+const MAX_TILEMAP_CELLS := 2000
+## Cells one edit_tilemap operation may touch — guards against runaway fills.
+const MAX_TILEMAP_EDIT := 20000
+
+
+## Resolve the target node, or null (with the error in out["error"]).
+func _tilemap_node(p: Dictionary, out: Dictionary) -> Node:
+	var path := str(p.get("path", ""))
+	var node := _get_node(path)
+	if node == null:
+		out["error"] = _err(-32000, "Node not found: %s" % path)
+		return null
+	if not (node is TileMapLayer or node is TileMap):
+		out["error"] = _err(
+			-32000, "%s is a %s, not a TileMapLayer or TileMap." % [node.name, node.get_class()]
+		)
+		return null
+	return node
+
+
+func _tm_tile_set(node: Node) -> TileSet:
+	return node.get("tile_set")
+
+
+func _tm_used_cells(node: Node, layer: int) -> Array:
+	if node is TileMapLayer:
+		return (node as TileMapLayer).get_used_cells()
+	return (node as TileMap).get_used_cells(layer)
+
+
+func _tm_used_rect(node: Node) -> Rect2i:
+	if node is TileMapLayer:
+		return (node as TileMapLayer).get_used_rect()
+	return (node as TileMap).get_used_rect()
+
+
+func _tm_set_cell(node: Node, layer: int, c: Vector2i, sid: int, atlas: Vector2i, alt: int) -> void:
+	if node is TileMapLayer:
+		(node as TileMapLayer).set_cell(c, sid, atlas, alt)
+	else:
+		(node as TileMap).set_cell(layer, c, sid, atlas, alt)
+
+
+func _tm_erase_cell(node: Node, layer: int, c: Vector2i) -> void:
+	if node is TileMapLayer:
+		(node as TileMapLayer).erase_cell(c)
+	else:
+		(node as TileMap).erase_cell(layer, c)
+
+
+## One painted cell as the compact [x, y, sourceId, atlasX, atlasY, alt] tuple.
+func _tm_cell_tuple(node: Node, layer: int, c: Vector2i) -> Array:
+	if node is TileMapLayer:
+		var l := node as TileMapLayer
+		var la := l.get_cell_atlas_coords(c)
+		return [c.x, c.y, l.get_cell_source_id(c), la.x, la.y, l.get_cell_alternative_tile(c)]
+	var t := node as TileMap
+	var ta := t.get_cell_atlas_coords(layer, c)
+	return [c.x, c.y, t.get_cell_source_id(layer, c), ta.x, ta.y, t.get_cell_alternative_tile(layer, c)]
+
+
+func _rect_from(p: Variant) -> Rect2i:
+	if typeof(p) != TYPE_DICTIONARY:
+		return Rect2i()
+	var d: Dictionary = p
+	return Rect2i(
+		int(d.get("x", 0)), int(d.get("y", 0)), int(d.get("width", 0)), int(d.get("height", 0))
+	)
+
+
+## "" when the tile reference resolves in the TileSet, else the error message.
+func _tile_error(ts: TileSet, tile: Dictionary) -> String:
+	if ts == null:
+		return "The node has no TileSet assigned. Run setup_atlas (or assign one) first."
+	var sid := int(tile.get("sourceId", -1))
+	if not ts.has_source(sid):
+		var ids := PackedStringArray()
+		for i in range(ts.get_source_count()):
+			ids.append(str(ts.get_source_id(i)))
+		return "TileSet has no source %d (existing sources: %s)." % [sid, ", ".join(ids)]
+	var src := ts.get_source(sid)
+	if src is TileSetAtlasSource:
+		var coords := Vector2i(int(tile.get("atlasX", 0)), int(tile.get("atlasY", 0)))
+		if not (src as TileSetAtlasSource).has_tile(coords):
+			var grid := (src as TileSetAtlasSource).get_atlas_grid_size()
+			return (
+				"Atlas source %d has no tile at (%d, %d) (grid is %dx%d; transparent regions have no tiles)."
+				% [sid, coords.x, coords.y, grid.x, grid.y]
+			)
+	return ""
+
+
+func _tile_ref(tile: Dictionary) -> Array:
+	return [
+		int(tile.get("sourceId", 0)),
+		Vector2i(int(tile.get("atlasX", 0)), int(tile.get("atlasY", 0))),
+		int(tile.get("alternative", 0)),
+	]
+
+
+func _get_tilemap(p: Dictionary) -> Dictionary:
+	var out := {}
+	var node := _tilemap_node(p, out)
+	if node == null:
+		return out["error"]
+	var layer := int(p.get("layer", 0))
+
+	var tile_set_info: Variant = null
+	var ts := _tm_tile_set(node)
+	if ts != null:
+		var sources := []
+		for i in range(ts.get_source_count()):
+			var sid := ts.get_source_id(i)
+			var src := ts.get_source(sid)
+			var info := {"id": sid, "type": src.get_class()}
+			if src is TileSetAtlasSource:
+				var atlas := src as TileSetAtlasSource
+				var tex := atlas.texture
+				info["texture"] = "" if tex == null else tex.resource_path
+				var region := atlas.texture_region_size
+				info["textureRegionSize"] = "%dx%d" % [region.x, region.y]
+				var grid := atlas.get_atlas_grid_size()
+				info["gridSize"] = "%dx%d" % [grid.x, grid.y]
+				info["tileCount"] = atlas.get_tiles_count()
+			sources.append(info)
+		tile_set_info = {
+			"tileSize": "%dx%d" % [ts.tile_size.x, ts.tile_size.y],
+			"sources": sources,
+		}
+
+	var used: Array = _tm_used_cells(node, layer)
+	var region_given: bool = p.has("region")
+	var region := _rect_from(p.get("region"))
+	var cells := []
+	var matching := 0
+	var truncated := false
+	for cell_variant in used:
+		var c: Vector2i = cell_variant
+		if region_given and not region.has_point(c):
+			continue
+		matching += 1
+		if cells.size() >= MAX_TILEMAP_CELLS:
+			truncated = true
+			continue
+		cells.append(_tm_cell_tuple(node, layer, c))
+	var used_rect := _tm_used_rect(node)
+
+	return _ok({
+		"path": str(p.get("path", "")),
+		"nodeType": node.get_class(),
+		"tileSet": tile_set_info,
+		"usedRect": null if used.is_empty() else {
+			"x": used_rect.position.x,
+			"y": used_rect.position.y,
+			"width": used_rect.size.x,
+			"height": used_rect.size.y,
+		},
+		"cellCount": matching if region_given else used.size(),
+		"cells": cells,
+		"truncated": truncated,
+	})
+
+
+func _edit_tilemap(p: Dictionary) -> Dictionary:
+	var out := {}
+	var node := _tilemap_node(p, out)
+	if node == null:
+		return out["error"]
+	var layer := int(p.get("layer", 0))
+	var operation := str(p.get("operation", ""))
+
+	if operation == "setup_atlas":
+		return _setup_atlas(node, p)
+
+	var mutates_with_tile := operation in ["set_cells", "fill_rect", "draw_line"]
+	var tile: Dictionary = p.get("tile", {}) if typeof(p.get("tile")) == TYPE_DICTIONARY else {}
+	if mutates_with_tile:
+		var tile_err := _tile_error(_tm_tile_set(node), tile)
+		if not tile_err.is_empty():
+			return _err(-32000, tile_err)
+	var ref := _tile_ref(tile)
+
+	var changed := 0
+	match operation:
+		"set_cells", "erase_cells":
+			var raw: Variant = p.get("cells", [])
+			if typeof(raw) != TYPE_ARRAY:
+				return _err(-32602, "cells must be an array of {x, y}.")
+			var cell_list: Array = raw
+			if cell_list.size() > MAX_TILEMAP_EDIT:
+				return _err(-32602, "Too many cells (%d; cap is %d)." % [cell_list.size(), MAX_TILEMAP_EDIT])
+			for cell_variant in cell_list:
+				if typeof(cell_variant) != TYPE_DICTIONARY:
+					continue
+				var cd: Dictionary = cell_variant
+				var c := Vector2i(int(cd.get("x", 0)), int(cd.get("y", 0)))
+				if operation == "set_cells":
+					_tm_set_cell(node, layer, c, ref[0], ref[1], ref[2])
+				else:
+					_tm_erase_cell(node, layer, c)
+				changed += 1
+		"fill_rect", "erase_rect":
+			var rect := _rect_from(p.get("rect"))
+			if rect.size.x <= 0 or rect.size.y <= 0:
+				return _err(-32602, "rect needs a positive width and height.")
+			if rect.get_area() > MAX_TILEMAP_EDIT:
+				return _err(-32602, "rect covers %d cells (cap is %d)." % [rect.get_area(), MAX_TILEMAP_EDIT])
+			for y in range(rect.position.y, rect.end.y):
+				for x in range(rect.position.x, rect.end.x):
+					if operation == "fill_rect":
+						_tm_set_cell(node, layer, Vector2i(x, y), ref[0], ref[1], ref[2])
+					else:
+						_tm_erase_cell(node, layer, Vector2i(x, y))
+					changed += 1
+		"draw_line":
+			var from_d: Dictionary = p.get("from", {}) if typeof(p.get("from")) == TYPE_DICTIONARY else {}
+			var to_d: Dictionary = p.get("to", {}) if typeof(p.get("to")) == TYPE_DICTIONARY else {}
+			var a := Vector2i(int(from_d.get("x", 0)), int(from_d.get("y", 0)))
+			var b := Vector2i(int(to_d.get("x", 0)), int(to_d.get("y", 0)))
+			for c in _line_cells(a, b):
+				_tm_set_cell(node, layer, c, ref[0], ref[1], ref[2])
+				changed += 1
+		_:
+			return _err(-32601, "Unknown edit_tilemap operation: %s" % operation)
+
+	_mark_unsaved()
+	return _ok({"ok": true, "cellsChanged": changed})
+
+
+## Bresenham between two cells, inclusive; diagonals paint stair steps.
+func _line_cells(a: Vector2i, b: Vector2i) -> Array[Vector2i]:
+	var cells: Array[Vector2i] = []
+	var d := (b - a).abs()
+	var step := Vector2i(1 if a.x < b.x else -1, 1 if a.y < b.y else -1)
+	var err := d.x - d.y
+	var c := a
+	while true:
+		cells.append(c)
+		if c == b or cells.size() > MAX_TILEMAP_EDIT:
+			break
+		var e2 := 2 * err
+		if e2 > -d.y:
+			err -= d.y
+			c.x += step.x
+		if e2 < d.x:
+			err += d.x
+			c.y += step.y
+	return cells
+
+
+## Create a TileSetAtlasSource from a texture, registering a tile for every
+## grid cell that has visible pixels (mirrors what the Godot editor's atlas
+## auto-create does). Creates and assigns a TileSet when the node has none;
+## reuses an existing atlas source for the same texture instead of duplicating.
+func _setup_atlas(node: Node, p: Dictionary) -> Dictionary:
+	var tex_path := str(p.get("textureResPath", ""))
+	if not ResourceLoader.exists(tex_path):
+		return _err(-32000, "Texture not found: %s" % tex_path)
+	var tex: Variant = load(tex_path)
+	if not (tex is Texture2D):
+		return _err(-32000, "%s is not a Texture2D." % tex_path)
+	var tw := int(p.get("tileWidth", 0))
+	var th := int(p.get("tileHeight", 0))
+	if tw <= 0 or th <= 0:
+		return _err(-32602, "tileWidth and tileHeight must be positive.")
+
+	var ts := _tm_tile_set(node)
+	if ts == null:
+		ts = TileSet.new()
+		ts.tile_size = Vector2i(tw, th)
+		node.set("tile_set", ts)
+
+	for i in range(ts.get_source_count()):
+		var sid := ts.get_source_id(i)
+		var existing := ts.get_source(sid)
+		if existing is TileSetAtlasSource and (existing as TileSetAtlasSource).texture == tex:
+			return _ok({"ok": true, "cellsChanged": 0, "sourceId": sid})
+
+	var src := TileSetAtlasSource.new()
+	src.texture = tex
+	src.texture_region_size = Vector2i(tw, th)
+	var source_id := ts.add_source(src)
+
+	var img: Image = (tex as Texture2D).get_image()
+	if img != null and img.is_compressed():
+		if img.decompress() != OK:
+			img = null  # can't inspect pixels: register every grid cell below
+	var cols := (tex as Texture2D).get_width() / tw
+	var rows := (tex as Texture2D).get_height() / th
+	var created := 0
+	for y in range(rows):
+		for x in range(cols):
+			if _region_has_pixels(img, Rect2i(x * tw, y * th, tw, th)):
+				src.create_tile(Vector2i(x, y))
+				created += 1
+
+	_mark_unsaved()
+	return _ok({"ok": true, "cellsChanged": created, "sourceId": source_id})
+
+
+func _region_has_pixels(img: Image, rect: Rect2i) -> bool:
+	if img == null:
+		return true
+	for y in range(rect.position.y, rect.end.y):
+		for x in range(rect.position.x, rect.end.x):
+			if img.get_pixel(x, y).a > 0.0:
+				return true
+	return false
 
 
 func _mark_unsaved() -> void:
