@@ -12,7 +12,7 @@ extends RefCounted
 const DEFAULT_PORT := 6010
 # Must match plugin.cfg's version; ping reports it so the IDE can tell when a
 # stale copy of the addon is still the one running in the editor.
-const VERSION := "0.6.0"
+const VERSION := "0.7.0"
 # Byte length of the "\r\n\r\n" header terminator. (A PackedByteArray
 # constructor call is not a constant expression, so keep the size, not
 # the bytes; _find_header_end matches the bytes directly.)
@@ -641,27 +641,60 @@ func _capture_screenshot(p: Dictionary) -> Dictionary:
 # --- Shader checking ---------------------------------------------------------
 
 ## Compile a Godot shader without running the game and report its errors.
-## Params: resPath (res:// path of a .gdshader) or code (raw source); resPath
-## wins and also anchors relative #include resolution.
+## Params: resPath (res:// path of a .gdshader, or a .tres/.res serialized
+## shader resource — a VisualShader graph or a saved Shader) or code (raw
+## source); resPath wins and also anchors relative #include resolution.
 ##
 ## Setting Shader.code alone DEFERS compilation — querying the uniform list is
 ## what forces the parse (verified on 4.7, both real and dummy renderers).
 ## Errors are intercepted with a Logger (4.5+, guarded). Missing #include
 ## files are checked statically first: the renderer reports nothing capturable
-## for those.
+## for those. VisualShader graphs are checked by compiling their GENERATED
+## code (returned as generatedCode so error lines are actionable); errors
+## printed while the resource loads — e.g. an invalid graph connection being
+## dropped — are captured as resourceErrors, the only window they surface in.
 func _check_shader(p: Dictionary) -> Dictionary:
 	var res_path := str(p.get("resPath", ""))
 	var source := str(p.get("code", ""))
+	var is_resource := res_path.ends_with(".tres") or res_path.ends_with(".res")
 	if not res_path.is_empty():
 		if not FileAccess.file_exists(res_path):
 			return _err(-32000, "Shader file not found: %s" % res_path)
-		source = FileAccess.get_file_as_string(res_path)
+		if not is_resource:
+			source = FileAccess.get_file_as_string(res_path)
 	elif source.is_empty():
 		return _err(-32602, "Provide resPath or code.")
 
+	var logger_ok := ClassDB.class_exists("Logger") and OS.has_method("add_logger")
+	var logger: RefCounted = null
+	if logger_ok:
+		logger = (load("res://addons/godotai_bridge/shader_check_logger.gd") as Script).new()
+
+	var resource_type := ""
+	var resource_errors: Array = []
+	if is_resource:
+		# CACHE_MODE_REPLACE re-reads the file, so a graph the IDE wrote this
+		# turn is what actually gets validated (not a stale cached resource).
+		if logger != null:
+			logger.set("capture_generic", true)
+			OS.call("add_logger", logger)
+		var res: Resource = ResourceLoader.load(res_path, "", ResourceLoader.CACHE_MODE_REPLACE)
+		if logger != null:
+			OS.call("remove_logger", logger)
+			logger.set("capture_generic", false)
+			resource_errors = logger.get("generic_errors")
+		if res == null or not (res is Shader):
+			var detail := "" if resource_errors.is_empty() else " Load errors: %s" % "; ".join(
+				PackedStringArray(resource_errors))
+			return _err(-32000, "%s did not load as a Shader resource.%s" % [res_path, detail])
+		resource_type = res.get_class()
+		# For a VisualShader this is the code generated from the graph; error
+		# line numbers below refer to it.
+		source = (res as Shader).code
+
 	var errors: Array[Dictionary] = _missing_includes(source, res_path)
 
-	if not ClassDB.class_exists("Logger") or not OS.has_method("add_logger"):
+	if not logger_ok:
 		return _ok({
 			"compiled": false,
 			"reason": "Shader error capture needs Godot 4.5+ (this editor is %s)."
@@ -669,18 +702,25 @@ func _check_shader(p: Dictionary) -> Dictionary:
 			"errors": errors,
 			"uniforms": [],
 			"shaderType": _shader_type_of(source),
+			"resourceType": resource_type,
+			"resourceErrors": resource_errors,
 		})
 
-	var logger: RefCounted = (
-		load("res://addons/godotai_bridge/shader_check_logger.gd") as Script
-	).new()
 	OS.call("add_logger", logger)
 	var shader := Shader.new()
 	shader.code = source
 	# Forces the deferred compile; also yields the uniforms on success.
 	var uniform_list: Array = shader.get_shader_uniform_list()
 	OS.call("remove_logger", logger)
-	errors.append_array(logger.get("shader_errors"))
+	# Loading a VisualShader compiles its generated code once already; the
+	# fresh compile above reports the same errors again. Dedupe by line+text.
+	var seen := {}
+	for e_variant in logger.get("shader_errors"):
+		var e: Dictionary = e_variant
+		var key := "%s:%s" % [e.get("line"), e.get("message")]
+		if not seen.has(key):
+			seen[key] = true
+			errors.append(e)
 
 	var uniforms := []
 	for u in uniform_list:
@@ -695,12 +735,17 @@ func _check_shader(p: Dictionary) -> Dictionary:
 			"name": str(d.get("name", "")),
 			"type": type_name,
 		})
-	return _ok({
+	var result := {
 		"compiled": true,
 		"errors": errors,
 		"uniforms": uniforms,
 		"shaderType": _shader_type_of(source),
-	})
+		"resourceType": resource_type,
+		"resourceErrors": resource_errors,
+	}
+	if is_resource:
+		result["generatedCode"] = source
+	return _ok(result)
 
 
 ## Statically resolve #include targets: a missing include produces no
