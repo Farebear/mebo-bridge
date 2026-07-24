@@ -12,7 +12,7 @@ extends RefCounted
 const DEFAULT_PORT := 6010
 # Must match plugin.cfg's version; ping reports it so the IDE can tell when a
 # stale copy of the addon is still the one running in the editor.
-const VERSION := "0.5.0"
+const VERSION := "0.6.0"
 # Byte length of the "\r\n\r\n" header terminator. (A PackedByteArray
 # constructor call is not a constant expression, so keep the size, not
 # the bytes; _find_header_end matches the bytes directly.)
@@ -208,6 +208,8 @@ func _handle(method: String, p: Dictionary) -> Dictionary:
 			return _get_tilemap(p)
 		"edit_tilemap":
 			return _edit_tilemap(p)
+		"check_shader":
+			return _check_shader(p)
 		"run_project":
 			var main_scene := _sync_run_settings()
 			if main_scene.is_empty():
@@ -634,6 +636,101 @@ func _capture_screenshot(p: Dictionary) -> Dictionary:
 		"height": image.get_height(),
 		"mediaType": "image/png",
 	})
+
+
+# --- Shader checking ---------------------------------------------------------
+
+## Compile a Godot shader without running the game and report its errors.
+## Params: resPath (res:// path of a .gdshader) or code (raw source); resPath
+## wins and also anchors relative #include resolution.
+##
+## Setting Shader.code alone DEFERS compilation — querying the uniform list is
+## what forces the parse (verified on 4.7, both real and dummy renderers).
+## Errors are intercepted with a Logger (4.5+, guarded). Missing #include
+## files are checked statically first: the renderer reports nothing capturable
+## for those.
+func _check_shader(p: Dictionary) -> Dictionary:
+	var res_path := str(p.get("resPath", ""))
+	var source := str(p.get("code", ""))
+	if not res_path.is_empty():
+		if not FileAccess.file_exists(res_path):
+			return _err(-32000, "Shader file not found: %s" % res_path)
+		source = FileAccess.get_file_as_string(res_path)
+	elif source.is_empty():
+		return _err(-32602, "Provide resPath or code.")
+
+	var errors: Array[Dictionary] = _missing_includes(source, res_path)
+
+	if not ClassDB.class_exists("Logger") or not OS.has_method("add_logger"):
+		return _ok({
+			"compiled": false,
+			"reason": "Shader error capture needs Godot 4.5+ (this editor is %s)."
+				% Engine.get_version_info()["string"],
+			"errors": errors,
+			"uniforms": [],
+			"shaderType": _shader_type_of(source),
+		})
+
+	var logger: RefCounted = (
+		load("res://addons/godotai_bridge/shader_check_logger.gd") as Script
+	).new()
+	OS.call("add_logger", logger)
+	var shader := Shader.new()
+	shader.code = source
+	# Forces the deferred compile; also yields the uniforms on success.
+	var uniform_list: Array = shader.get_shader_uniform_list()
+	OS.call("remove_logger", logger)
+	errors.append_array(logger.get("shader_errors"))
+
+	var uniforms := []
+	for u in uniform_list:
+		var d: Dictionary = u
+		var type_name := type_string(int(d.get("type", TYPE_NIL)))
+		# Sampler uniforms report as Variant type Object; the concrete class
+		# (e.g. "Texture2D") rides in hint_string.
+		var hint := str(d.get("hint_string", ""))
+		if type_name == "Object" and not hint.is_empty():
+			type_name = hint
+		uniforms.append({
+			"name": str(d.get("name", "")),
+			"type": type_name,
+		})
+	return _ok({
+		"compiled": true,
+		"errors": errors,
+		"uniforms": uniforms,
+		"shaderType": _shader_type_of(source),
+	})
+
+
+## Statically resolve #include targets: a missing include produces no
+## capturable compile error on the real renderer, so it is checked here.
+## Relative includes resolve against the including file's directory.
+func _missing_includes(source: String, res_path: String) -> Array[Dictionary]:
+	var found: Array[Dictionary] = []
+	var regex := RegEx.new()
+	regex.compile("^\\s*#include\\s+\"([^\"]+)\"")
+	var lines := source.split("\n")
+	for i in range(lines.size()):
+		var m := regex.search(lines[i])
+		if m == null:
+			continue
+		var inc := m.get_string(1)
+		var target := inc
+		if not inc.begins_with("res://"):
+			if res_path.is_empty():
+				continue  # raw code with a relative include: nothing to resolve against
+			target = res_path.get_base_dir().path_join(inc)
+		if not FileAccess.file_exists(target):
+			found.append({"line": i + 1, "message": "Included file not found: %s" % inc})
+	return found
+
+
+func _shader_type_of(source: String) -> String:
+	var regex := RegEx.new()
+	regex.compile("shader_type\\s+([a-z_]+)\\s*;")
+	var m := regex.search(source)
+	return m.get_string(1) if m != null else ""
 
 
 # --- Tilemap operations ------------------------------------------------------
