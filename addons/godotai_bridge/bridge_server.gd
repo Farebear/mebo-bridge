@@ -12,7 +12,7 @@ extends RefCounted
 const DEFAULT_PORT := 6010
 # Must match plugin.cfg's version; ping reports it so the IDE can tell when a
 # stale copy of the addon is still the one running in the editor.
-const VERSION := "0.7.0"
+const VERSION := "0.7.1"
 # Byte length of the "\r\n\r\n" header terminator. (A PackedByteArray
 # constructor call is not a constant expression, so keep the size, not
 # the bytes; _find_header_end matches the bytes directly.)
@@ -303,6 +303,16 @@ func _reload_changed_files(p: Dictionary) -> Dictionary:
 	var res_paths: Array = raw
 
 	var fs := EditorInterface.get_resource_filesystem()
+	# Register each written file synchronously first: update_file() parses its
+	# `class_name` into the global script class cache immediately, where the
+	# async scan() below lands too late for the buffer revalidation and left
+	# phantom "Could not find type" errors in the script editor (BUG-4,
+	# docs/ide-test-report-2026-08-01.md).
+	if fs != null and fs.has_method("update_file"):
+		for path_variant in res_paths:
+			var res_path := str(path_variant)
+			if FileAccess.file_exists(res_path):
+				fs.call("update_file", res_path)
 	if fs != null and not fs.is_scanning():
 		fs.scan()
 
@@ -334,10 +344,9 @@ func _reload_changed_files(p: Dictionary) -> Dictionary:
 			refreshed_resources += 1
 
 	if scripts_changed:
-		var script_editor := EditorInterface.get_script_editor()
-		# reload_open_files postdates 4.4; without it, buffers refresh on focus.
-		if script_editor != null and script_editor.has_method("reload_open_files"):
-			script_editor.call("reload_open_files")
+		# Fire-and-forget: buffers must revalidate AFTER the rescan finishes,
+		# not while the class cache is still being rebuilt (see above).
+		_refresh_script_editor_after_scan()
 
 	# reload_scene_from_path focuses the reloaded scene's tab; put the user
 	# back on the scene they were actually looking at.
@@ -385,6 +394,24 @@ func _schedule_plugin_reload() -> void:
 
 ## get_unsaved_scenes postdates the 4.4 baseline; without it, report none
 ## (changed open scenes are then reloaded unconditionally).
+## Reload script-editor buffers once the filesystem scan has settled, so the
+## revalidation sees the fresh script class cache. Runs as a coroutine on the
+## server object (held by the plugin for the editor's lifetime, so it is never
+## collected mid-await). reload_open_files postdates the 4.4 baseline; without
+## it, buffers still refresh on the next window focus.
+func _refresh_script_editor_after_scan() -> void:
+	var fs := EditorInterface.get_resource_filesystem()
+	var base := EditorInterface.get_base_control()
+	var tree := base.get_tree() if base != null else null
+	if fs != null and tree != null:
+		var deadline := Time.get_ticks_msec() + 10_000
+		while fs.is_scanning() and Time.get_ticks_msec() < deadline:
+			await tree.process_frame
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor != null and script_editor.has_method("reload_open_files"):
+		script_editor.call("reload_open_files")
+
+
 func _unsaved_scene_paths() -> PackedStringArray:
 	if not EditorInterface.has_method("get_unsaved_scenes"):
 		return PackedStringArray()
